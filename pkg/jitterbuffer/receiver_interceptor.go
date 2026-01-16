@@ -4,12 +4,18 @@
 package jitterbuffer
 
 import (
+	"errors"
 	"sync"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 )
+
+// ErrWaitingForPacket is returned when a packet is missing and the interceptor
+// is waiting for it to arrive. The caller should retry the read operation.
+var ErrWaitingForPacket = errors.New("waiting for missing packet")
 
 // InterceptorFactory is a interceptor.Factory for a GeneratorInterceptor.
 type InterceptorFactory struct {
@@ -19,8 +25,10 @@ type InterceptorFactory struct {
 // NewInterceptor constructs a new ReceiverInterceptor.
 func (g *InterceptorFactory) NewInterceptor(_ string) (interceptor.Interceptor, error) {
 	receiverInterceptor := &ReceiverInterceptor{
-		close:  make(chan struct{}),
-		buffer: New(),
+		buffer:         nil, // initialized after options are applied
+		timeout:        100 * time.Millisecond,
+		minPacketCount: 50,
+		gapDetectedAt:  make(map[uint16]time.Time),
 	}
 
 	for _, opt := range g.opts {
@@ -28,6 +36,9 @@ func (g *InterceptorFactory) NewInterceptor(_ string) (interceptor.Interceptor, 
 			return nil, err
 		}
 	}
+
+	// Initialize JitterBuffer with the configured minPacketCount.
+	receiverInterceptor.buffer = New(WithMinimumPacketCount(receiverInterceptor.minPacketCount))
 
 	if receiverInterceptor.loggerFactory == nil {
 		receiverInterceptor.loggerFactory = logging.NewDefaultLoggerFactory()
@@ -61,9 +72,15 @@ type ReceiverInterceptor struct {
 	buffer        *JitterBuffer
 	m             sync.Mutex
 	wg            sync.WaitGroup
-	close         chan struct{}
 	log           logging.LeveledLogger
 	loggerFactory logging.LoggerFactory
+
+	// timeout is the duration to wait for missing packets before skipping.
+	timeout time.Duration
+	// minPacketCount is the minimum packet count before playout begins.
+	minPacketCount uint16
+	// gapDetectedAt tracks when each missing packet was first detected.
+	gapDetectedAt map[uint16]time.Time
 }
 
 // NewInterceptor returns a new InterceptorFactory.
@@ -86,21 +103,62 @@ func (i *ReceiverInterceptor) BindRemoteStream(
 		if err := packet.Unmarshal(buf); err != nil {
 			return 0, nil, err
 		}
+
 		i.m.Lock()
 		defer i.m.Unlock()
-		i.buffer.Push(packet)
-		if i.buffer.state == Emitting {
-			newPkt, err := i.buffer.Pop()
-			if err != nil {
-				return 0, nil, err
-			}
-			nlen, err := newPkt.MarshalTo(b)
 
-			return nlen, attr, err
+		i.buffer.Push(packet)
+
+		if i.buffer.state != Emitting {
+			return n, attr, ErrPopWhileBuffering
 		}
 
-		return n, attr, ErrPopWhileBuffering
+		// Try to pop with timeout-based skip handling.
+		return i.tryPop(b, attr)
 	})
+}
+
+// tryPop attempts to pop a packet from the buffer.
+// If a packet is missing, it checks if the timeout has elapsed and skips if necessary.
+// Returns ErrWaitingForPacket if still waiting for a missing packet.
+func (i *ReceiverInterceptor) tryPop(b []byte, attr interceptor.Attributes) (int, interceptor.Attributes, error) {
+	for {
+		playoutHead := i.buffer.PlayoutHead()
+		newPkt, err := i.buffer.Pop()
+
+		if err == nil {
+			// Success: clear the detection time and return the packet.
+			delete(i.gapDetectedAt, playoutHead)
+			nlen, marshalErr := newPkt.MarshalTo(b)
+
+			return nlen, attr, marshalErr
+		}
+
+		// Check if it's a missing packet error.
+		if !errors.Is(err, ErrNotFound) {
+			return 0, nil, err
+		}
+
+		// Record the first detection time for this missing packet.
+		now := time.Now()
+		if _, exists := i.gapDetectedAt[playoutHead]; !exists {
+			i.gapDetectedAt[playoutHead] = now
+		}
+
+		detectedAt := i.gapDetectedAt[playoutHead]
+		elapsed := now.Sub(detectedAt)
+
+		if elapsed < i.timeout {
+			// Still waiting for the packet.
+			return 0, attr, ErrWaitingForPacket
+		}
+
+		// Timeout: skip this packet and try the next one.
+		i.log.Debugf("packet %d timed out after %v, skipping", playoutHead, elapsed)
+		delete(i.gapDetectedAt, playoutHead)
+		i.buffer.SetPlayoutHead(playoutHead + 1)
+		// Continue to try the next packet.
+	}
 }
 
 // UnbindRemoteStream is called when the Stream is removed. It can be used to clean up any data related to that track.

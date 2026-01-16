@@ -4,6 +4,8 @@
 package jitterbuffer
 
 import (
+	"time"
+
 	"github.com/pion/logging"
 )
 
@@ -23,6 +25,28 @@ func Log(log logging.LeveledLogger) ReceiverInterceptorOption {
 func WithLoggerFactory(loggerFactory logging.LoggerFactory) ReceiverInterceptorOption {
 	return func(d *ReceiverInterceptor) error {
 		d.loggerFactory = loggerFactory
+
+		return nil
+	}
+}
+
+// WithTimeout sets the timeout duration for waiting missing packets.
+// When a packet is missing, the interceptor will wait up to this duration
+// for the packet to arrive before skipping it.
+// Default: 100ms.
+func WithTimeout(timeout time.Duration) ReceiverInterceptorOption {
+	return func(d *ReceiverInterceptor) error {
+		d.timeout = timeout
+
+		return nil
+	}
+}
+
+// WithMinPacketCount sets the minimum packet count before playout begins.
+// Default: 50.
+func WithMinPacketCount(count uint16) ReceiverInterceptorOption {
+	return func(d *ReceiverInterceptor) error {
+		d.minPacketCount = count
 
 		return nil
 	}
