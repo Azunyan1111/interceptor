@@ -19,6 +19,14 @@ type EncodedFrame struct {
 	// LastSeqNum is the RTP sequence number of the last packet in this frame.
 	LastSeqNum uint16
 
+	// FirstSeqNumUnwrapped is the unwrapped sequence number of the first packet.
+	// Used for proper ordering and reference resolution across 16-bit wrap-around.
+	FirstSeqNumUnwrapped int64
+
+	// LastSeqNumUnwrapped is the unwrapped sequence number of the last packet.
+	// Used for proper ordering and reference resolution across 16-bit wrap-around.
+	LastSeqNumUnwrapped int64
+
 	// Timestamp is the RTP timestamp of the frame.
 	Timestamp uint32
 
@@ -88,11 +96,13 @@ func (a *VideoFrameAssembler) AssembleFrame(packets []*BufferedPacket) *EncodedF
 	frameID := a.frameIDCounter.Add(1) - 1
 
 	frame := &EncodedFrame{
-		ID:          frameID,
-		FirstSeqNum: uint16(firstPkt.SequenceNumber & 0xFFFF),
-		LastSeqNum:  uint16(lastPkt.SequenceNumber & 0xFFFF),
-		Timestamp:   firstPkt.Timestamp,
-		Data:        data,
+		ID:                   frameID,
+		FirstSeqNum:          uint16(firstPkt.SequenceNumber & 0xFFFF),
+		LastSeqNum:           uint16(lastPkt.SequenceNumber & 0xFFFF),
+		FirstSeqNumUnwrapped: firstPkt.SequenceNumber,
+		LastSeqNumUnwrapped:  lastPkt.SequenceNumber,
+		Timestamp:            firstPkt.Timestamp,
+		Data:                 data,
 	}
 
 	// Extract frame type from first packet's VideoHeader

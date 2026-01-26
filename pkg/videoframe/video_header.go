@@ -72,6 +72,13 @@ func NewRTPVideoHeaderFromVP8(pkt *codecs.VP8Packet, marker bool) *RTPVideoHeade
 	// Last packet is determined by RTP marker bit
 	header.IsLastPacketInFrame = marker
 
+	// Detect keyframe from VP8 payload header (only for first packet of frame)
+	// Reference: RFC 7741 Section 4.3, libwebrtc video_rtp_depacketizer_vp8.cc:186-187
+	// The P bit (bit 0 of first byte) indicates: 0 = keyframe, 1 = interframe
+	if header.IsFirstPacketInFrame {
+		header.FrameType = DetectVP8FrameType(pkt.Payload)
+	}
+
 	// Extract PictureID if present (I bit in extension)
 	// RFC 7741: I=1 indicates PictureID is present
 	if pkt.I == 1 {
@@ -91,4 +98,31 @@ func NewRTPVideoHeaderFromVP8(pkt *codecs.VP8Packet, marker bool) *RTPVideoHeade
 	}
 
 	return header
+}
+
+// DetectVP8FrameType detects the frame type from the VP8 payload header.
+// Reference: RFC 7741 Section 4.3 - VP8 Payload Header
+//
+// VP8 Payload Header (first byte after VP8 Payload Descriptor):
+//
+//	   0 1 2 3 4 5 6 7
+//	  +-+-+-+-+-+-+-+-+
+//	  |Size0|H| VER |P|
+//	  +-+-+-+-+-+-+-+-+
+//
+// P bit (bit 0): 0 = keyframe, 1 = interframe (predictive frame)
+//
+// Reference: libwebrtc video_rtp_depacketizer_vp8.cc:186-187
+//
+//	if (video_header->is_first_packet_in_frame && (*vp8_payload & 0x01) == 0) {
+//	    video_header->frame_type = VideoFrameType::kVideoFrameKey;
+func DetectVP8FrameType(vp8Payload []byte) FrameType {
+	if len(vp8Payload) == 0 {
+		return FrameTypeDelta
+	}
+	// P bit is bit 0: 0 = keyframe, 1 = interframe
+	if (vp8Payload[0] & 0x01) == 0 {
+		return FrameTypeKey
+	}
+	return FrameTypeDelta
 }

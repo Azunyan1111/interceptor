@@ -66,6 +66,12 @@ type streamState struct {
 	packetBuffer   *VideoPacketBuffer
 	frameAssembler *VideoFrameAssembler
 	seqUnwrapper   *sequenceUnwrapper
+
+	// Each ref finder type is created lazily and kept for the stream lifetime.
+	// Frame-level selection chooses the appropriate ref finder based on available info.
+	seqNumOnlyRefFinder  *SeqNumOnlyRefFinder
+	frameIdOnlyRefFinder *FrameIdOnlyRefFinder
+	vp8RefFinder         *VP8RefFinder
 }
 
 // sequenceUnwrapper unwraps 16-bit sequence numbers to int64.
@@ -171,10 +177,20 @@ func (r *ReceiverInterceptor) BindRemoteStream(
 		unwrappedSeq := state.seqUnwrapper.unwrap(pkt.SequenceNumber)
 
 		// Create buffered packet
+		// Use vp8.Payload (depacketized video payload without VP8 descriptor)
+		// instead of pkt.Payload (raw RTP payload with VP8 descriptor)
+		// Reference: libwebrtc's depacketizer extracts video_payload from RTP payload
+		//
+		// IMPORTANT: Copy the payload because vp8.Payload references the Read buffer b,
+		// which will be overwritten on the next Read call.
+		// Reference: libwebrtc video_rtp_depacketizer copies video_payload
+		payloadCopy := make([]byte, len(vp8.Payload))
+		copy(payloadCopy, vp8.Payload)
+
 		bufferedPkt := &BufferedPacket{
 			SequenceNumber: unwrappedSeq,
 			Timestamp:      pkt.Timestamp,
-			Payload:        pkt.Payload,
+			Payload:        payloadCopy,
 			VideoHeader:    videoHeader,
 			MarkerBit:      pkt.Marker,
 		}
@@ -186,21 +202,36 @@ func (r *ReceiverInterceptor) BindRemoteStream(
 
 		// Check for completed frames
 		if len(result.Frames) > 0 {
-			var frames []*EncodedFrame
+			var resolvedFrames []*EncodedFrame
 			for _, framePackets := range result.Frames {
 				frame := state.frameAssembler.AssembleFrame(framePackets)
-				if frame != nil {
-					frames = append(frames, frame)
+				if frame == nil {
+					continue
 				}
+
+				// Get video header from first packet for reference finder selection
+				var firstHeader *RTPVideoHeader
+				if len(framePackets) > 0 && framePackets[0].VideoHeader != nil {
+					firstHeader = framePackets[0].VideoHeader
+				}
+
+				// Select appropriate reference finder based on frame's header info
+				r.streamsMu.Lock()
+				refFinder := r.selectRefFinderForFrame(state, firstHeader)
+
+				// Resolve frame references
+				resolved := refFinder.ManageFrame(frame, firstHeader)
+				resolvedFrames = append(resolvedFrames, resolved...)
+				r.streamsMu.Unlock()
 			}
 
-			if len(frames) > 0 {
+			if len(resolvedFrames) > 0 {
 				if attrs == nil {
 					attrs = make(interceptor.Attributes)
 				}
 				// Set both keys for compatibility
-				attrs.Set(EncodedFramesKey, frames)
-				attrs.Set(EncodedFrameKey, frames[0]) // First frame for backward compatibility
+				attrs.Set(EncodedFramesKey, resolvedFrames)
+				attrs.Set(EncodedFrameKey, resolvedFrames[0]) // First frame for backward compatibility
 			}
 		}
 
@@ -242,6 +273,41 @@ func (r *ReceiverInterceptor) getOrCreateStreamState(ssrc uint32) (*streamState,
 
 	r.streams[ssrc] = state
 	return state, nil
+}
+
+// selectRefFinderForFrame selects the appropriate reference finder for a frame
+// based on the available header information.
+// This method should be called with streamsMu held.
+//
+// Reference finder selection (based on libwebrtc rtp_frame_reference_finder.cc):
+// 1. If temporal layer info is available (TID, TL0PICIDX, PictureID all present) -> VP8RefFinder
+// 2. If only picture ID is available -> FrameIdOnlyRefFinder
+// 3. Otherwise -> SeqNumOnlyRefFinder
+//
+// Each ref finder is created lazily and kept for the stream lifetime.
+// This allows frame-by-frame selection based on actual available info,
+// avoiding the issue where a VP8RefFinder fallback behaves differently
+// from SeqNumOnlyRefFinder.
+func (r *ReceiverInterceptor) selectRefFinderForFrame(state *streamState, header *RTPVideoHeader) FrameReferenceFinder {
+	refType := SelectRefFinderType(header)
+
+	switch refType {
+	case RefFinderVP8:
+		if state.vp8RefFinder == nil {
+			state.vp8RefFinder = NewVP8RefFinder()
+		}
+		return state.vp8RefFinder
+	case RefFinderFrameIDOnly:
+		if state.frameIdOnlyRefFinder == nil {
+			state.frameIdOnlyRefFinder = NewFrameIdOnlyRefFinder()
+		}
+		return state.frameIdOnlyRefFinder
+	default:
+		if state.seqNumOnlyRefFinder == nil {
+			state.seqNumOnlyRefFinder = NewSeqNumOnlyRefFinder()
+		}
+		return state.seqNumOnlyRefFinder
+	}
 }
 
 // isVP8Stream checks if the stream is a VP8 video stream.

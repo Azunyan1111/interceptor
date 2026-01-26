@@ -240,3 +240,108 @@ func TestRTPVideoHeader_VP8_TL0PicIdx(t *testing.T) {
 		})
 	}
 }
+
+func TestDetectVP8FrameType(t *testing.T) {
+	// Reference: RFC 7741 Section 4.3
+	// VP8 Payload Header: P bit (bit 0) = 0 for keyframe, 1 for interframe
+	tests := []struct {
+		name     string
+		payload  []byte
+		expected FrameType
+	}{
+		{
+			name:     "Keyframe (P=0)",
+			payload:  []byte{0x00}, // P bit = 0
+			expected: FrameTypeKey,
+		},
+		{
+			name:     "Keyframe with other bits set (P=0)",
+			payload:  []byte{0xFE}, // 11111110 - P bit = 0
+			expected: FrameTypeKey,
+		},
+		{
+			name:     "Interframe (P=1)",
+			payload:  []byte{0x01}, // P bit = 1
+			expected: FrameTypeDelta,
+		},
+		{
+			name:     "Interframe with other bits set (P=1)",
+			payload:  []byte{0xFF}, // 11111111 - P bit = 1
+			expected: FrameTypeDelta,
+		},
+		{
+			name:     "Empty payload defaults to delta",
+			payload:  []byte{},
+			expected: FrameTypeDelta,
+		},
+		{
+			name:     "Nil payload defaults to delta",
+			payload:  nil,
+			expected: FrameTypeDelta,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := DetectVP8FrameType(tt.payload)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestRTPVideoHeader_VP8_KeyframeDetection(t *testing.T) {
+	// Test that NewRTPVideoHeaderFromVP8 correctly detects keyframes
+	// Reference: libwebrtc video_rtp_depacketizer_vp8.cc:186-187
+
+	tests := []struct {
+		name        string
+		s           uint8
+		pid         uint8
+		payload     []byte
+		expectedFT  FrameType
+	}{
+		{
+			name:       "First packet of keyframe",
+			s:          1,
+			pid:        0,
+			payload:    []byte{0x00}, // P=0 (keyframe)
+			expectedFT: FrameTypeKey,
+		},
+		{
+			name:       "First packet of interframe",
+			s:          1,
+			pid:        0,
+			payload:    []byte{0x01}, // P=1 (interframe)
+			expectedFT: FrameTypeDelta,
+		},
+		{
+			name:       "Not first packet - frame type not detected (zero value)",
+			s:          0,
+			pid:        0,
+			payload:    []byte{0x00}, // Would be keyframe, but S=0
+			expectedFT: FrameTypeKey, // Zero value (not detected, defaults to FrameTypeKey)
+		},
+		{
+			name:       "First packet with PID!=0 - frame type not detected (zero value)",
+			s:          1,
+			pid:        1,
+			payload:    []byte{0x00}, // Would be keyframe, but PID!=0
+			expectedFT: FrameTypeKey, // Zero value (not detected, defaults to FrameTypeKey)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vp8Pkt := &codecs.VP8Packet{
+				S:       tt.s,
+				PID:     tt.pid,
+				Payload: tt.payload,
+			}
+
+			header := NewRTPVideoHeaderFromVP8(vp8Pkt, false)
+
+			require.NotNil(t, header)
+			assert.Equal(t, tt.expectedFT, header.FrameType, "FrameType mismatch")
+		})
+	}
+}
